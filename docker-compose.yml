@@ -65,6 +65,12 @@ services:
   llama:
     build:
       context: ./llama
+      # Hardware-specific compile params (see the BUILD section in .env).
+      # Baked into the image at build time; rebuild after changing them.
+      args:
+        CUDA_VERSION:       ${CUDA_VERSION:-13.1.2}
+        CUDA_ARCHITECTURES: ${CUDA_ARCHITECTURES:-89}
+        BUILD_JOBS:         ${BUILD_JOBS:-16}
     image: lair/llama:latest
     container_name: lair-llama
     restart: unless-stopped

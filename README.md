@@ -33,8 +33,27 @@ small *active* parameter count rather than the full model size. Dense models of
 comparable quality (Gemma 4 31B, Qwen3.6-27B) are deliberately excluded — they
 don't fit 12 GB VRAM and fall back to slow CPU inference.
 
-If you run different hardware, the model menu and the context sizes in `.env`
-are the first things to revisit.
+> ### ⚠️ Building on different hardware — read this first
+>
+> The llama image is **compiled for a specific GPU at build time.** The default
+> targets the RTX 4070 (`CUDA_ARCHITECTURES=89`, Ada Lovelace). **If your GPU is
+> not an Ada-generation card, you must set `CUDA_ARCHITECTURES` for your card in
+> `.env` *before your first build*** — otherwise the binary builds fine but
+> `llama-server` dies at startup with *"no kernel image is available for
+> execution on the device."*
+>
+> Find your card's compute capability at
+> [developer.nvidia.com/cuda-gpus](https://developer.nvidia.com/cuda-gpus) and
+> drop the dot (e.g. 8.6 → `86`). Common values: RTX 50xx = `120`, RTX 40xx =
+> `89`, RTX 30xx = `86`, RTX 20xx = `75`, A100 = `80`, H100 = `90`. The `.env`
+> **BUILD** section lists these plus a portable "safe NVIDIA" multi-arch option
+> and notes on Apple Silicon (which the CUDA-only image does **not** support).
+> All compile params (`CUDA_ARCHITECTURES`, `CUDA_VERSION`, `BUILD_JOBS`) live in
+> the **BUILD** section of `.env`; changing them requires a rebuild
+> (`docker compose build llama`), not just a restart.
+
+Beyond the GPU arch, if you run different hardware the model menu and the context
+sizes in `.env` are the next things to revisit.
 
 ## Model menu (quick reference)
 
@@ -241,9 +260,21 @@ the point of knowing what changed.
 
 ## `.env` reference
 
-`.env` has two sections: **GLOBAL** knobs (same for every model) and a **MODEL**
-menu of commented blocks. Sampler / context / chat-template values live inside
-each model block, not here — they're model-specific.
+`.env` has three sections: **BUILD** knobs (compile-time, hardware-specific),
+**GLOBAL** knobs (runtime, same for every model), and a **MODEL** menu of
+commented blocks. Sampler / context / chat-template values live inside each model
+block, not here — they're model-specific.
+
+### Build knobs (compile-time — rebuild after changing)
+
+These are baked into the llama image. Set them for your hardware **before your
+first build**; a change needs `docker compose build llama`, not just a restart.
+
+| Variable | Required | Description |
+|---|---|---|
+| `CUDA_ARCHITECTURES` | **yes (match your GPU)** | GPU compute capability without the dot (8.9 → `89`). Default `89` = RTX 4070. Wrong value → runtime "no kernel image available". |
+| `CUDA_VERSION` | no | CUDA toolkit / base-image version (default `13.1.2`; needs host driver R580+, else `12.6.0`) |
+| `BUILD_JOBS` | no | Parallel compile jobs (default `16`; set to your CPU core count) |
 
 ### Global knobs
 

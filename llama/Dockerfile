@@ -1,13 +1,34 @@
 # Multi-stage build: compile llama.cpp from a pinned release tag with CUDA, then
 # ship just the binary + CUDA runtime.
 
+# ============================================================================
+#  HARDWARE-SPECIFIC BUILD PARAMETERS
+# ============================================================================
+# The defaults below target an NVIDIA RTX 4070 (Ada Lovelace). They are baked
+# into the binary at build time and MUST match your hardware — a mismatch on
+# CUDA_ARCHITECTURES produces an image that fails at runtime with "no kernel
+# image is available for execution on the device".
+#
+# Don't edit them here. Set them in `.env` (read automatically by docker
+# compose, see the BUILD section there) or override on the command line:
+#     docker compose build --build-arg CUDA_ARCHITECTURES=86 llama
+# ----------------------------------------------------------------------------
+
 # CUDA 13.x requires a recent NVIDIA host driver (R580+). If `nvidia-smi` on
-# the host shows an older driver, either upgrade it or override at build
-# time:  docker compose build --build-arg CUDA_VERSION=12.6.0 llama
+# the host shows an older driver, either upgrade it or set CUDA_VERSION=12.6.0
+# (in .env or via --build-arg).
 ARG CUDA_VERSION=13.1.2
 ARG UBUNTU_VERSION=24.04
 
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
+
+# Hardware-specific args, re-declared inside the stage so the build steps can
+# see them (an ARG before the first FROM is only visible to FROM lines).
+#   CUDA_ARCHITECTURES — GPU compute capability WITHOUT the dot (8.9 -> 89).
+#                        89 = Ada Lovelace (RTX 4070). Must match your card.
+#   BUILD_JOBS         — parallel compile jobs; set to your CPU core count.
+ARG CUDA_ARCHITECTURES=89
+ARG BUILD_JOBS=16
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git cmake build-essential ca-certificates \
@@ -36,12 +57,12 @@ RUN git clone --depth 1 --branch b9354 https://github.com/ggml-org/llama.cpp.git
 WORKDIR /build/llama.cpp
 RUN cmake -B build \
         -DGGML_CUDA=ON \
-        -DCMAKE_CUDA_ARCHITECTURES=89 \
+        -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES} \
         -DLLAMA_CURL=OFF \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,/usr/local/cuda/lib64/stubs" \
         -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath-link,/usr/local/cuda/lib64/stubs" \
-    && cmake --build build --config Release -j16 --target llama-server
+    && cmake --build build --config Release -j${BUILD_JOBS} --target llama-server
 
 # Collect everything we need to copy: the binary plus any shared libs it
 # built alongside it (ggml etc.).
