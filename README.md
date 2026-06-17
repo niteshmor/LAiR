@@ -100,14 +100,18 @@ The benchmark harnesses are in [`bench/`](bench/).
 #    `docker compose down -v` can never wipe an expensive model download.
 docker volume create lair_llama-models
 
-# 2. Configure. Uncomment exactly one model block in .env. Qwen3.6-35B-A3B
-#    (block [2]) is the default; see the model menu above for alternatives.
+# 2. Create your local config from the template (.env is gitignored).
+cp .env.example .env
+
+# 3. Configure. Qwen3.6-35B-A3B (block [2]) is already uncommented as the
+#    default, so you can skip ahead for a first run; to pick another model,
+#    uncomment exactly one other block (see the model menu above).
 $EDITOR .env
 
-# 3. Build images, auto-download the model, start the stack.
+# 4. Build images, auto-download the model, start the stack.
 docker compose up -d --build
 
-# 4. Confirm the network boundary holds.
+# 5. Confirm the network boundary holds.
 ./verify-isolation.sh
 ```
 
