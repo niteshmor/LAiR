@@ -68,6 +68,74 @@ wget -e use_proxy=on \
 Internal hostnames (`searxng`, `llama`, `haproxy`, `playwright`) are in
 `NO_PROXY` and reach directly — no proxy flags needed for them.
 
+### Fetching a page: save to disk first, then decide
+
+The default is **fetch to a file, not straight into context.** A web page can be
+huge, off-topic, or garbage you didn't expect — and once it's in context it's
+there for the rest of the session, costing tokens on every turn and dragging you
+toward compaction. Writing to disk first is cheap insurance: if your processing
+step has a bug, you fix the script and re-run it against the saved file instead
+of re-fetching (slow, and through rotating Tor exits you may not even get the
+same page back).
+
+This applies to **every way you pull a full page**: the `searxng` URL-read tool,
+the `playwright` text/navigate tools, and `curl`/`wget`. (The `searxng` *search*
+tool is exempt — its results are already capped by `SEARXNG_MAX_RESULTS` /
+`SEARXNG_MIN_SCORE`, so a search response is bounded and small. It's fetching the
+*contents of a result URL* that can blow up your context.)
+
+1. **Fetch to a file.** With curl/wget, redirect to disk:
+   `curl -sL https://example.com/long -o /tmp/page.html`. The `searxng` URL-read
+   and `playwright` tools hand their output back as a tool result rather than a
+   file, so you don't get this for free — when their output is large, write it to
+   a file first (Write tool / heredoc) before doing anything else with it. If you
+   can foresee the page is big, prefer fetching the URL with `curl -o` in the
+   first place so it lands on disk directly and never enters context.
+2. **Check size and shape before reading** — `wc -c`, `wc -l`, `head`. Don't
+   pull the whole thing into context yet.
+3. **Then judge** (below) whether to load it or distill it on disk.
+
+**Load straight into context only when** the payload is small (rule of thumb:
+under ~1–2k tokens / a few hundred lines) *and* you already know it's relevant —
+a short API JSON response, a focused doc page you requested by exact URL. Just
+read it; disk round-tripping tiny payloads is needless ceremony.
+
+**Distill on disk when** the payload is large, *or* you're not yet sure it's
+relevant, *or* it's likely mostly boilerplate (nav, ads, markup). Extract only
+what you need with deterministic tools and read *that* into context:
+
+- `grep`/`rg` for the lines that matter, `jq` for JSON fields, `python -c` or a
+  small script for structured extraction, `sed`/`pup`/`html2text` to strip HTML
+  down to prose.
+- Read the filtered result, never the raw file.
+
+The discipline is: **deterministic, re-runnable processing on disk; only the
+distilled result crosses into context.** That buys you the thing people usually
+reach for a summarizer sub-agent to get — junk kept out of context — without
+paying the sub-agent's cost on this stack (next section).
+
+---
+
+## Sub-agents and the KV cache (stack-specific)
+
+This Claude runs against a **single-slot** llama.cpp server (`--parallel 1`), and
+speed depends on its **prompt-prefix KV-cache reuse**: each turn reuses the prior
+conversation as a cached prefix and prefills only the new tokens.
+
+A sub-agent (Task tool) is a *different* conversation that shares no prefix —
+dispatching one overwrites the main session's cached KV, and returning forces the
+whole main context to re-prefill from scratch (very slow at long context). Adding
+slots doesn't help: `--parallel N` splits the context N ways and 100k is the
+compaction floor. So **don't reach for sub-agents.** Whatever you'd delegate to a
+summarizer/extractor sub-agent, do inline with scripts over a saved file (above)
+— same context savings, no eviction. A sub-agent earns the re-prefill only for a
+single large task that genuinely needs model judgment you can't script.
+
+This does **not** restrict the "run queries in parallel" advice below: batching
+multiple search/fetch tool calls in one turn is fine — those are network calls to
+SearXNG/Playwright, not model inference, so they never touch the KV cache. Only
+parallel *sub-agents* are the problem.
+
 ---
 
 ## Research Execution Strategy
