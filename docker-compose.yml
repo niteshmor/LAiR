@@ -1,0 +1,240 @@
+# LAiR (LLM Agent In Residence): local LLM + SearXNG + Tor proxy pool.
+# private_net has `internal: true` so nothing on it can reach the internet
+# except via the dual-homed tor-proxy-N containers.
+#
+# Tor pool size = 3 here. To change it: add/remove tor-proxy-N services
+# below, and update searxng/config/settings.yml and haproxy/haproxy.cfg
+# in lockstep.
+
+name: lair
+
+networks:
+  private_net:
+    driver: bridge
+    internal: true
+  external_net:
+    driver: bridge
+
+volumes:
+  # Declared external so `docker compose down -v` never deletes it — model
+  # downloads are large/expensive. The model-downloader service populates it
+  # on first `up`. On a fresh machine, create it once before the first `up`:
+  #   docker volume create lair_llama-models
+  llama-models:
+    external: true
+    name: lair_llama-models
+
+  # Claude's working directory. Compose-managed — `docker compose down -v`
+  # wipes it.
+  workspace:
+
+  # Persists ~/.claude (MCP config, history) across rebuilds. `down -v`
+  # wipes it; recreate when you've rebuilt the claude image and want the
+  # new image's MCP config to take effect.
+  claude-state:
+
+  # Per-proxy Tor data directories: cache consensus, descriptors, and guard
+  # state across restarts so each node bootstraps in seconds rather than
+  # minutes. Compose-managed — `down -v` wipes them for a true clean start.
+  tor-state-1:
+  tor-state-2:
+  tor-state-3:
+
+services:
+
+  # ---- Model downloader (init container) ---------------------------------
+  # Runs once before llama starts. Downloads the model from HuggingFace Hub
+  # if not already present in the llama-models volume, then exits.
+  # Lives on external_net only — the only service besides Tor proxies with
+  # internet access. The llama service stays isolated on private_net.
+  model-downloader:
+    build:
+      context: ./downloader
+    image: lair/model-downloader:latest
+    container_name: lair-model-downloader
+    networks: [external_net]
+    volumes:
+      - llama-models:/models
+    environment:
+      LLAMA_HF_REPO: ${LLAMA_HF_REPO:-}
+      LLAMA_HF_FILE: ${LLAMA_HF_FILE:-}
+      LLAMA_MODEL:   ${LLAMA_MODEL:-}
+      HF_TOKEN:      ${HF_TOKEN:-}
+    restart: "no"
+
+  llama:
+    build:
+      context: ./llama
+    image: lair/llama:latest
+    container_name: lair-llama
+    restart: unless-stopped
+    networks: [private_net]
+    volumes:
+      - llama-models:/models:ro
+    depends_on:
+      model-downloader: {condition: service_completed_successfully}
+    environment:
+      LLAMA_MODEL:   ${LLAMA_MODEL:-}
+      LLAMA_HF_REPO: ${LLAMA_HF_REPO:-}
+      LLAMA_HF_FILE: ${LLAMA_HF_FILE:-}
+      LLAMA_ALIAS: ${LLAMA_HF_REPO}
+      LLAMA_CTX_SIZE: ${LLAMA_CTX_SIZE:-32768}
+      LLAMA_TEMP: ${LLAMA_TEMP:-1.0}
+      LLAMA_TOP_P: ${LLAMA_TOP_P:-0.95}
+      LLAMA_MIN_P: ${LLAMA_MIN_P:-0.01}
+      LLAMA_BATCH_SIZE: ${LLAMA_BATCH_SIZE:-4096}
+      LLAMA_UBATCH_SIZE: ${LLAMA_UBATCH_SIZE:-1024}
+      LLAMA_CACHE_TYPE_K: ${LLAMA_CACHE_TYPE_K:-q8_0}
+      LLAMA_CACHE_TYPE_V: ${LLAMA_CACHE_TYPE_V:-q8_0}
+      LLAMA_FLASH_ATTN: ${LLAMA_FLASH_ATTN:-on}
+      LLAMA_SLEEP_IDLE_SECONDS: ${LLAMA_SLEEP_IDLE_SECONDS:-600}
+      LLAMA_EXTRA_ARGS: ${LLAMA_EXTRA_ARGS:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  searxng:
+    # searxng/searxng:latest — pinned by digest 2026-06-07
+    image: searxng/searxng@sha256:b5d4892daf19736acdefc34a67bb06dd702638beb282e993aeb612e0953c2d54
+    container_name: lair-searxng
+    restart: unless-stopped
+    networks: [private_net]
+    # Wrapper guarantees a real secret_key: passes SEARXNG_SECRET through when set
+    # in .env, otherwise mints a random one per start (see searxng/entrypoint.sh).
+    entrypoint: ["/bin/sh", "/wrapper-entrypoint.sh"]
+    volumes:
+      - ./searxng/config:/etc/searxng:ro
+      - ./searxng/data:/var/cache/searxng
+      - ./searxng/entrypoint.sh:/wrapper-entrypoint.sh:ro
+    environment:
+      SEARXNG_DEBUG: "1"
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-}
+    depends_on:
+      tor-proxy-1: { condition: service_healthy }
+      tor-proxy-2: { condition: service_healthy }
+      tor-proxy-3: { condition: service_healthy }
+
+  haproxy:
+    # haproxy:lts-alpine — pinned by digest 2026-06-07
+    image: haproxy@sha256:4293e7e02c70e143778c86b4916f1b89e04f7a9221534b9abf6cace218c6b95f
+    container_name: lair-haproxy
+    restart: unless-stopped
+    networks: [private_net]
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      tor-proxy-1: { condition: service_healthy }
+      tor-proxy-2: { condition: service_healthy }
+      tor-proxy-3: { condition: service_healthy }
+
+  claude:
+    build:
+      context: ./claude
+    image: lair/claude:latest
+    container_name: lair-claude
+    networks: [private_net]
+    stdin_open: true
+    tty: true
+    depends_on:
+      llama:       {condition: service_started}
+      searxng:     {condition: service_started}
+      haproxy:     {condition: service_started}
+      playwright:  {condition: service_healthy}
+    volumes:
+      - claude-state:/home/ubuntu/.claude
+      - workspace:/home/ubuntu/claude
+    environment:
+      ANTHROPIC_BASE_URL: http://llama:8080
+      ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-dummy}
+      ANTHROPIC_MODEL: ${LLAMA_HF_REPO}
+      HTTP_PROXY: http://haproxy:8118
+      HTTPS_PROXY: http://haproxy:8118
+      NO_PROXY: searxng,llama,haproxy,playwright,localhost,127.0.0.1
+      # SearXNG result-noise filter — synced into the mcp registration by the
+      # claude entrypoint (tunable via .env, no rebuild). See patch-searxng.js.
+      SEARXNG_MAX_RESULTS: ${SEARXNG_MAX_RESULTS:-8}
+      SEARXNG_MIN_SCORE: ${SEARXNG_MIN_SCORE:-0.3}
+      TERM: ${TERM:-xterm-256color}
+      # Tell Claude Code the real context window so it compacts at the right
+      # time. Without this it assumes 200K for unknown model names, which for
+      # a 202K model means it never fires proactively.
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS: ${LLAMA_CTX_SIZE:-32768}
+      # Must match LLAMA_CTX_SIZE: tells Claude Code the real context window
+      # so it compacts at the right threshold instead of assuming 200K.
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: ${LLAMA_CTX_SIZE:-32768}
+
+  # ---- Tor proxy pool ----------------------------------------------------
+  # First service holds the base config via a YAML anchor; the rest merge
+  # it and override container_name.
+
+  tor-proxy-1: &tor-proxy
+    # dperson/torproxy:latest — pinned by digest 2026-06-07
+    image: dperson/torproxy@sha256:d8b5f1cf24f1b7a0aa334929a264b2606a107223dd0d51eb1cda8aae6fbeec53
+    container_name: lair-tor-proxy-1
+    restart: unless-stopped
+    volumes:
+      - ./tor/torrc:/etc/tor/torrc:ro
+      - tor-state-1:/var/lib/tor
+    environment:
+      TOR_NewCircuitPeriod: "600"
+    networks: [private_net, external_net]
+    healthcheck:
+      test: ["CMD-SHELL", "tor-resolve example.com 127.0.0.1:9050 >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 20s
+      start_period: 60s
+      retries: 5
+
+  tor-proxy-2:
+    <<: *tor-proxy
+    container_name: lair-tor-proxy-2
+    volumes:
+      - ./tor/torrc:/etc/tor/torrc:ro
+      - tor-state-2:/var/lib/tor
+
+  tor-proxy-3:
+    <<: *tor-proxy
+    container_name: lair-tor-proxy-3
+    volumes:
+      - ./tor/torrc:/etc/tor/torrc:ro
+      - tor-state-3:/var/lib/tor
+
+
+  # ---- Playwright headless browser (MCP server) -------------------------
+  # Exposes @playwright/mcp over HTTP on private_net:3000. Claude connects
+  # via: http://playwright:3000/mcp (streamable HTTP transport).
+  # Browser traffic is routed through haproxy → Tor pool.
+  playwright:
+    build:
+      context: ./playwright
+    image: lair/playwright:latest
+    container_name: lair-playwright
+    restart: unless-stopped
+    networks: [private_net]
+    shm_size: '2gb'
+    environment:
+      DEBUG: "pw:api"
+    depends_on: [haproxy]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo >/dev/tcp/localhost/3000' 2>/dev/null"]
+      interval: 15s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+
+  # ---- SearXNG host forwarder -------------------------------------------
+  # Exposes searxng on http://localhost:8888 from the host.
+  # Needs both default bridge (for host port access) and private_net (to reach searxng).
+  searxng-forward:
+    # alpine/socat:latest — pinned by digest 2026-06-07
+    image: alpine/socat@sha256:cc2ab2488d6b39cbac670d18fdca5f87ea44fe630697a09d8558afb17f3269a1
+    container_name: lair-searxng-forward
+    networks: [default, private_net]
+    ports:
+      - "8888:8080"
+    command: TCP-LISTEN:8080,fork,reuseaddr TCP:searxng:8080
+    depends_on: [searxng]

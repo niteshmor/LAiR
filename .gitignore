@@ -1,0 +1,12 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Local environment — copy .env.example to .env and customize
+.env
+
+# Claude Code local working state
+.claude/
+
+# SearXNG runtime cache (generated at run time)
+searxng/data/

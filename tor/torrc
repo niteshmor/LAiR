@@ -1,0 +1,27 @@
+# Tor configuration with aggressive circuit rotation and logging
+
+# Network binding
+SocksPort 0.0.0.0:9050
+ControlPort 0.0.0.0:9051
+
+# Circuit management — both values in seconds
+# NewCircuitPeriod: build a new circuit at least this often
+# MaxCircuitDirtiness: retire a circuit after it's been used this long
+MaxCircuitDirtiness 600
+NewCircuitPeriod 600
+
+# Fail slow circuit builds quickly; keep the pool snappy
+CircuitBuildTimeout 10
+
+# Fetch network consensus as soon as Tor starts (speeds up cold bootstrap)
+FetchDirInfoEarly 1
+
+# Pipeline data into the circuit before exit confirms (Tor Browser default)
+OptimisticData 1
+
+# Logging to stdout for `docker logs` visibility
+# notice: bootstrap, guard selection, circuit built/closed
+# [app]info: exit node name + IP per connection (link_apconn_to_circ lines)
+Log notice stdout
+Log [app]info stdout
+SafeLogging 0
