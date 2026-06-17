@@ -23,7 +23,7 @@ Every model and parameter choice in this repo targets one machine profile:
 - **GPU:** NVIDIA RTX 4070 — **12 GB VRAM**
 - **RAM:** **32 GB** system memory
 - **Combined budget:** ~44 GB (VRAM + RAM), of which the other containers
-  (claude, searxng, playwright, haproxy, 3× tor) take a few GB.
+  (claude, searxng, playwright, haproxy, 3× tor, direct-proxy) take a few GB.
 - **Goal:** 20+ tokens/sec at a usable quality level.
 
 That budget is why every bundled model is a **Mixture-of-Experts (MoE) with only
@@ -175,8 +175,13 @@ docker compose logs -f llama                    # llama.cpp inference server
 docker compose logs -f model-downloader         # HuggingFace download progress
 docker compose logs -f searxng                  # search engine errors, engine blocks
 docker compose logs -f haproxy | grep tor-      # which tor-N handled each request
+docker compose logs -f haproxy | grep direct_   # requests routed direct (no Tor)
 docker compose logs -f tor-proxy-1              # circuit building, exit nodes
+docker compose logs -f direct-proxy             # direct-exit (no-Tor) proxy
 ```
+
+Each haproxy access-log line names the backend it chose (`tor_http_pool/tor-N`
+or `direct_pool/direct-1`), so you can see exactly which path every request took.
 
 Exit nodes show up in Tor logs as: `exit circ ... SomeRelay at 185.x.x.x`
 
@@ -225,7 +230,9 @@ the registry (`docker manifest inspect <image>:<tag>`).
 **Soft pins (not byte-exact):** the NodeSource `setup_22.x` apt source tracks the
 latest Node 22.x patch (NodeSource prunes old patches, so it can't be patch-pinned
 — verified on 22.22.2), and `nvidia/cuda` is pinned by its version tag
-(`13.1.2-…-ubuntu24.04`) rather than digest. Both are stable in practice.
+(`13.1.2-…-ubuntu24.04`) rather than digest. `tinyproxy` (the direct-exit proxy)
+is installed via `apk` in `direct-proxy/Dockerfile`, so it tracks whatever Alpine
+ships for the pinned base. All are stable in practice.
 
 **To bump a pin:** change the value, rebuild that one service, and — for llama.cpp
 especially — re-run the [benchmarks](BENCHMARKS.md) (`bench/*.py`) and the
@@ -294,10 +301,36 @@ true clean start.
 To resize the pool: edit `docker-compose.yml`, `searxng/config/settings.yml`, and
 `haproxy/haproxy.cfg` in lockstep, then `docker compose up -d`.
 
+## Direct-exit domains (bypassing Tor)
+
+Some sites block Tor exits outright, or you simply don't need anonymity for them.
+List those in `DIRECT_DOMAINS` in `.env` (comma- or space-separated) and their
+traffic skips the Tor pool and exits straight to the internet:
+
+```bash
+DIRECT_DOMAINS=anthropic.com, github.com
+```
+
+A domain also covers its subdomains, so `anthropic.com` matches `api.anthropic.com`.
+Leave it blank (the default) to send everything through Tor. Apply a change with
+`docker compose up -d haproxy` — no rebuild.
+
+How it works: haproxy inspects each request's destination host (the CONNECT
+authority for HTTPS, the `Host` header for plain HTTP) and looks it up in a map
+built from `DIRECT_DOMAINS` at startup. A hit goes to the `direct-proxy`
+container — a tinyproxy that, like the Tor proxies, is dual-homed on
+`external_net` and exits directly. Everything else falls through to the Tor pool.
+haproxy itself stays sealed on `private_net`; only `direct-proxy` (and the Tor
+proxies) can reach the internet.
+
+> **No anonymity for direct domains.** A direct-listed domain sees your real IP —
+> that's the point, but only list domains where that's acceptable.
+
 ## Verification scripts
 
 ```bash
 ./verify-isolation.sh     # proves claude has no direct internet egress
+./verify-direct.sh        # proves DIRECT_DOMAINS bypass Tor and the rest don't
 ./verify-compaction.sh    # proves context auto-compaction fires (needs ctx ≥100k)
 ./verify-e2e.sh           # end-to-end: search, URL fetch, and Playwright all
                           #   work through the Claude Code CLI (--infra-only

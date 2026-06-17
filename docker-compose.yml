@@ -124,12 +124,21 @@ services:
     container_name: lair-haproxy
     restart: unless-stopped
     networks: [private_net]
+    # Entrypoint templates DIRECT_DOMAINS into the routing map, then exec's
+    # haproxy (see haproxy/entrypoint.sh). Same mounted-wrapper pattern as searxng.
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
     volumes:
       - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./haproxy/entrypoint.sh:/entrypoint.sh:ro
+    environment:
+      # Comma/space-separated domains that bypass Tor and exit directly. Empty =
+      # everything via Tor (unchanged default). Matches subdomains too.
+      DIRECT_DOMAINS: ${DIRECT_DOMAINS:-}
     depends_on:
       tor-proxy-1: { condition: service_healthy }
       tor-proxy-2: { condition: service_healthy }
       tor-proxy-3: { condition: service_healthy }
+      direct-proxy: { condition: service_healthy }
 
   claude:
     build:
@@ -202,6 +211,26 @@ services:
     volumes:
       - ./tor/torrc:/etc/tor/torrc:ro
       - tor-state-3:/var/lib/tor
+
+  # ---- Direct-exit proxy -------------------------------------------------
+  # The non-Tor egress. Domains in DIRECT_DOMAINS are routed here by haproxy and
+  # exit straight to the internet (no anonymisation). Dual-homed like the Tor
+  # proxies so it can reach external_net; everything else stays sealed on
+  # private_net. A tinyproxy that speaks plain HTTP and CONNECT, so haproxy just
+  # balances onto it the same way it does the Tor pool.
+  direct-proxy:
+    build:
+      context: ./direct-proxy
+    image: lair/direct-proxy:latest
+    container_name: lair-direct-proxy
+    restart: unless-stopped
+    networks: [private_net, external_net]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8118 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
 
 
   # ---- Playwright headless browser (MCP server) -------------------------
