@@ -181,6 +181,9 @@ services:
       # Must match LLAMA_CTX_SIZE: tells Claude Code the real context window
       # so it compacts at the right threshold instead of assuming 200K.
       CLAUDE_CODE_AUTO_COMPACT_WINDOW: ${LLAMA_CTX_SIZE:-32768}
+      # Idle-sleep window of the llama backend — the statusline derives its
+      # KV-cache TTL countdown from this (must match the llama service value).
+      LLAMA_SLEEP_IDLE_SECONDS: ${LLAMA_SLEEP_IDLE_SECONDS:-600}
 
   # ---- Tor proxy pool ----------------------------------------------------
   # First service holds the base config via a YAML anchor; the rest merge

@@ -42,33 +42,6 @@ fmt_duration() {
   fi
 }
 
-fmt_until() {
-  local target="$1"
-  local now="$2"
-  local diff=$(( target - now ))
-  [ "$diff" -le 0 ] && echo "now" && return
-  local h=$(( diff / 3600 ))
-  local m=$(( (diff % 3600) / 60 ))
-  if [ "$h" -gt 0 ]; then printf '%d:%02d' "$h" "$m"
-  else                    echo "${m}m"
-  fi
-}
-
-fmt_rate_limit() {
-  local pct="$1"
-  local label="$2"
-  local reset="$3"
-  local now="$4"
-  local color
-  if   [ "$pct" -lt 50 ]; then color="\033[32m"
-  elif [ "$pct" -lt 80 ]; then color="\033[33m"
-  else                          color="\033[31m"
-  fi
-  local result="${color}${label}:${pct}%\033[0m"
-  [ -n "$reset" ] && result="${result} (Resets in $(fmt_until "$reset" "$now"))"
-  echo "$result"
-}
-
 # ── 1. Working directory ──────────────────────────────────────────────────────
 cwd=$(echo "$input" | jq -r '.cwd // empty')
 project="PWD=${cwd/$HOME/\~}"
@@ -147,7 +120,13 @@ cache_read=$(echo "$input"  | jq -r '.context_window.current_usage.cache_read_in
 cache_write=$(echo "$input" | jq -r '.context_window.current_usage.cache_creation_input_tokens // 0')
 cache_str="$(fmt_k "$cache_read")/$(fmt_k "$cache_write")"
 
-# ── 4. Cache countdown timer (60-min Anthropic prompt-cache window) ───────────
+# ── 4. KV-cache countdown timer (llama.cpp idle-sleep window) ─────────────────
+# This Claude runs against a local llama.cpp server that unloads the model (and
+# drops its prompt-prefix KV cache) after LLAMA_SLEEP_IDLE_SECONDS of inactivity.
+# That idle window — not a fixed Anthropic prompt-cache TTL — is when the cached
+# prefix goes cold and the next turn pays a full re-prefill. Default mirrors the
+# compose default if the var isn't passed into the container.
+CACHE_TTL_SECONDS="${LLAMA_SLEEP_IDLE_SECONDS:-1800}"
 session_id=$(echo "$input" | jq -r '.session_id // empty')
 cache_timer_str=""
 if [ -n "$session_id" ]; then
@@ -170,14 +149,16 @@ if [ -n "$session_id" ]; then
   if [ -f "$timer_file" ]; then
     last_call=$(cat "$timer_file")
     elapsed=$(( now - last_call ))
-    remaining_secs=$(( 3600 - elapsed ))
+    remaining_secs=$(( CACHE_TTL_SECONDS - elapsed ))
     if [ "$remaining_secs" -le 0 ]; then
       cache_timer_str="\033[31mExpired\033[0m"
     else
       mins=$(( (remaining_secs + 59) / 60 ))
-      if   [ "$mins" -gt 30 ]; then timer_color="\033[32m"
-      elif [ "$mins" -gt 10 ]; then timer_color="\033[33m"
-      else                          timer_color="\033[31m"
+      # Thresholds scale with the configured window: green in the top half,
+      # yellow in the next fifth, red as it runs out.
+      if   [ "$remaining_secs" -gt $(( CACHE_TTL_SECONDS / 2 )) ]; then timer_color="\033[32m"
+      elif [ "$remaining_secs" -gt $(( CACHE_TTL_SECONDS / 5 )) ]; then timer_color="\033[33m"
+      else                                                              timer_color="\033[31m"
       fi
       cache_timer_str="${timer_color}$(printf '%-3s' "${mins}m")\033[0m"
     fi
@@ -230,20 +211,7 @@ if [ -n "$remaining" ]; then
   ctx_str="${color}${pct}% Remaining\033[0m"
 fi
 
-# ── 7. Session cost (color-coded by spend level) ─────────────────────────────
-cost_usd=$(echo "$input" | jq -r '.cost.total_cost_usd // empty')
-cost_str=""
-if [ -n "$cost_usd" ] && [ "$cost_usd" != "0" ]; then
-  # Compare in integer cents to avoid float issues
-  cost_cents=$(printf '%.0f' "$(echo "$cost_usd * 100" | bc 2>/dev/null || echo 0)")
-  if   [ "${cost_cents:-0}" -ge 100 ]; then cost_color="\033[31m"   # >=$1.00 red
-  elif [ "${cost_cents:-0}" -ge 10  ]; then cost_color="\033[33m"   # >=$0.10 yellow
-  else                                      cost_color="\033[2m"    # <$0.10  dim
-  fi
-  cost_str="${cost_color}$(printf '$%.2f' "$cost_usd")\033[0m"
-fi
-
-# ── 8. Session duration / API time ───────────────────────────────────────────
+# ── 7. Session duration / API time ───────────────────────────────────────────
 duration_ms=$(echo "$input"     | jq -r '.cost.total_duration_ms     // 0')
 api_duration_ms=$(echo "$input" | jq -r '.cost.total_api_duration_ms // 0')
 duration_str=""
@@ -251,22 +219,7 @@ duration_str=""
 api_str=""
 [ "$api_duration_ms" -gt 0 ] 2>/dev/null && api_str="API $(fmt_duration "$api_duration_ms")"
 
-# ── 9. Rate limits ────────────────────────────────────────────────────────────
-rl5h_pct=$(echo "$input"     | jq -r '.rate_limits.five_hour.used_percentage  // empty')
-rl5h_reset=$(echo "$input"   | jq -r '.rate_limits.five_hour.resets_at        // empty')
-rl7d_pct=$(echo "$input"     | jq -r '.rate_limits.seven_day.used_percentage  // empty')
-rl7d_reset=$(echo "$input"   | jq -r '.rate_limits.seven_day.resets_at        // empty')
-rate_str=""
-if [ -n "$rl5h_pct" ] || [ -n "$rl7d_pct" ]; then
-  now_rl=$(date +%s)
-  rl5h_pct=$(printf '%.0f' "$rl5h_pct")
-  rl7d_pct=$(printf '%.0f' "$rl7d_pct")
-  part5=$(fmt_rate_limit "$rl5h_pct" "5h" "$rl5h_reset" "$now_rl")
-  part7=$(fmt_rate_limit "$rl7d_pct" "7d" "$rl7d_reset" "$now_rl")
-  rate_str="${part5} ${part7}"
-fi
-
-# ── 10. Cumulative tokens (total input / output) ──────────────────────────────
+# ── 8. Cumulative tokens (total input / output) ───────────────────────────────
 total_in=$(echo "$input"  | jq -r '.context_window.total_input_tokens  // 0')
 total_out=$(echo "$input" | jq -r '.context_window.total_output_tokens // 0')
 total_tokens_str=""
@@ -274,8 +227,10 @@ if [ "$total_in" -gt 0 ] 2>/dev/null || [ "$total_out" -gt 0 ] 2>/dev/null; then
   total_tokens_str="$(fmt_k "$total_in")/$(fmt_k "$total_out")"
 fi
 
-# ── Assemble: fixed 4-line layout ─────────────────────────────────────────────
-line1=(); line2=(); line3=(); line4=()
+# ── Assemble: fixed 3-line layout ─────────────────────────────────────────────
+# No rate-limit / cost line: those are Anthropic-subscription concepts (5h/7d
+# quotas, per-token billing) that don't apply to a local llama.cpp backend.
+line1=(); line2=(); line3=()
 [ -n "$project" ]          && line1+=("${project}")
 [ -n "$git_str" ]          && line1+=("${git_str}")
 [ -n "$model_str" ]        && line1+=("${model_str}")
@@ -287,9 +242,6 @@ line1=(); line2=(); line3=(); line4=()
 [ -n "$cache_timer_str" ]  && line3+=("TTL ${cache_timer_str}")
 [ "$cache_str" != "0/0" ]  && line3+=("Cache r/w ${cache_str}")
 [ -n "$total_tokens_str" ] && line3+=("Tokens in/out ${total_tokens_str}")
-
-[ -n "$rate_str" ]         && line4+=("${rate_str}")
-[ -n "$cost_str" ]         && line4+=("${cost_str}")
 
 print_line() {
   [ "$#" -eq 0 ] && return
@@ -316,4 +268,3 @@ print_labeled_line() {
 print_line          "${line1[@]}"
 print_labeled_line "Ctx"    "${line2[@]}"
 print_labeled_line "Cache"  "${line3[@]}"
-print_labeled_line "Limits" "${line4[@]}"
